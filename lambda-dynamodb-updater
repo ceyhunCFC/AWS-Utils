@@ -1,0 +1,158 @@
+"use strict";
+
+const AWS = require("aws-sdk");
+
+const Cognito = new AWS.CognitoIdentityServiceProvider({ region: "us-east-1" });
+const DynamoDb = new AWS.DynamoDB({ region: "us-east-1" });
+
+/**
+ * AWS Lambda handler to update player stats based on a skill upgrade.
+ */
+exports.handler = async (event) => {
+  const accessToken = getHeader(event, "Authorization");
+  if (!accessToken) {
+    return response(401, { error: "Missing Authorization token." });
+  }
+
+  // Fetch user 'sub' from Cognito
+  let userId;
+  try {
+    const userData = await Cognito.getUser({ AccessToken: accessToken }).promise();
+    const subAttr = userData.UserAttributes.find(attr => attr.Name === "sub");
+    if (!subAttr) return response(400, { error: "Cognito user ID (sub) not found." });
+    userId = subAttr.Value;
+  } catch (error) {
+    return response(401, { error: "Invalid or expired access token.", details: error.message });
+  }
+
+  // Fetch player data from DynamoDB
+  let playerData;
+  try {
+    const result = await DynamoDb.getItem({
+      TableName: "Players",
+      Key: { Id: { S: userId } }
+    }).promise();
+
+    if (!result.Item) return response(404, { error: "Player not found." });
+    playerData = result.Item;
+  } catch (error) {
+    return response(500, { error: "Error fetching player data.", details: error.message });
+  }
+
+  // Normalize and parse player attributes
+  const stats = parsePlayerStats(playerData);
+
+  // Determine skill upgrade
+  const skill = (getHeader(event, "SkillName") || "").toLowerCase();
+  const characterIndex = parseInt(getHeader(event, "CharacterAIndex") || "0");
+  const ePointIndex = parseInt(getHeader(event, "EPointIndex") || "0");
+
+  applySkillUpgrade(stats, skill, characterIndex, ePointIndex);
+
+  // Prepare DynamoDB PutItem request
+  const updatedItem = formatPlayerItem(userId, stats);
+
+  try {
+    await DynamoDb.putItem({
+      TableName: "Players",
+      Item: updatedItem
+    }).promise();
+  } catch (error) {
+    return response(500, { error: "Failed to update player data.", details: error.message });
+  }
+
+  return response(200, {
+    message: "Player data updated successfully.",
+    updatedStats: stats
+  });
+};
+
+/**
+ * Helper to safely get headers (case-insensitive)
+ */
+function getHeader(event, key) {
+  return event.headers?.[key] || event.headers?.[key.toLowerCase()];
+}
+
+/**
+ * Convert DynamoDB item to plain object with integers
+ */
+function parsePlayerStats(data) {
+  const fields = [
+    "Speed", "FireSpeed", "Reload", "Damage", "Hop", "Magazine", "QDamage",
+    "EDamage", "UDamage", "CharacterA", "CharacterD", "CharacterF", "CharacterS",
+    "Zoom", "Armor", "Transfer", "EPoint", "MaxRank", "Wins", "Losses"
+  ];
+
+  const stats = {};
+  for (const field of fields) {
+    stats[field] = parseInt(data[field]?.N || "0");
+  }
+
+  return stats;
+}
+
+/**
+ * Apply skill upgrade logic to stats object
+ */
+function applySkillUpgrade(stats, skill, characterIndex, ePointIndex) {
+  switch (skill) {
+    case "speed":
+      stats.Speed += 30; break;
+    case "firespeed":
+      stats.FireSpeed += 1; break;
+    case "reload":
+      stats.Reload += 1; break;
+    case "damage":
+      stats.Damage += 1; break;
+    case "hop":
+      stats.Hop += 1; break;
+    case "magazine":
+      stats.Magazine += 1; break;
+    case "qdamage":
+      stats.QDamage += 1; break;
+    case "edamage":
+      stats.EDamage += 1; break;
+    case "udamage":
+      stats.UDamage += 1; break;
+    case "zoom":
+      stats.Zoom += 1; break;
+    case "armor":
+      stats.Armor += 1; break;
+    case "transfer":
+      stats.Transfer += 1; break;
+    case "maxrank":
+      stats.MaxRank += 1; break;
+    case "epoint":
+      stats.EPoint = ePointIndex; break;
+    case "charactera":
+      stats.CharacterA = characterIndex; break;
+    case "characterd":
+      stats.CharacterD = characterIndex; break;
+    case "characters":
+      stats.CharacterS = characterIndex; break;
+    case "characterf":
+      stats.CharacterF = characterIndex; break;
+  }
+}
+
+/**
+ * Convert plain stats object to DynamoDB Item format
+ */
+function formatPlayerItem(userId, stats) {
+  const item = { Id: { S: userId } };
+  for (const [key, value] of Object.entries(stats)) {
+    item[key] = { N: value.toString() };
+  }
+  return item;
+}
+
+/**
+ * HTTP-style JSON response
+ */
+function response(statusCode, body) {
+  return {
+    statusCode,
+    body: JSON.stringify(body)
+  };
+}
