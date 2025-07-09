@@ -1,0 +1,69 @@
+const AWS = require('aws-sdk');
+const cognitoIdentityServiceProvider = new AWS.CognitoIdentityServiceProvider({ region: 'us-east-1' });
+const dynamoDB = new AWS.DynamoDB({ region: 'us-east-1' });
+
+exports.handler = async (event) => {
+    try {
+        if (!event.headers || !event.headers.PlayerID) {
+            return createResponse(400, {
+                message: 'Missing PlayerID in headers'
+            });
+        }
+
+        const playerId = event.headers.PlayerID;
+
+        if (!isValidPlayerId(playerId)) {
+            return createResponse(400, {
+                message: 'Invalid PlayerID format'
+            });
+        }
+
+        const playerData = await getPlayerData(playerId);
+
+        if (!playerData) {
+            return createResponse(404, {
+                message: 'Player not found'
+            });
+        }
+
+        return createResponse(200, {
+            playerData: playerData
+        });
+
+    } catch (error) {
+        console.error('Error processing request:', error);
+        return createResponse(500, {
+            message: 'Internal server error',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+async function getPlayerData(playerId) {
+    const params = {
+        TableName: process.env.PLAYERS_TABLE || 'Players',
+        Key: {
+            Id: { S: playerId }
+        },
+        ConsistentRead: true 
+    };
+
+    const result = await dynamoDB.getItem(params).promise();
+    return result.Item;
+}
+
+function createResponse(statusCode, body) {
+    return {
+        statusCode,
+        headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify(body)
+    };
+}
+
+function isValidPlayerId(playerId) {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    return uuidRegex.test(playerId);
+}
