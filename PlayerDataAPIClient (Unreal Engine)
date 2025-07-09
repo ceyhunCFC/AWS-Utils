@@ -1,0 +1,224 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/GameModeBase.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "TargetGameMode.generated.h"
+
+/**
+ * Player statistics structure
+ */
+USTRUCT(BlueprintType)
+struct FPlayerStats
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadOnly)
+    float Wins = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float Losses = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float Speed = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float FireSpeed = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float Reload = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float Damage = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float Hop = 0.f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float Magazine = 0.f;
+};
+
+UCLASS()
+class TARGETGAME_API ATargetGameMode : public AGameModeBase
+{
+    GENERATED_BODY()
+
+public:
+
+    ATargetGameMode();
+
+    UFUNCTION(BlueprintCallable, Category = "Player Data")
+    void RequestPlayerData(const FString& PlayerId);
+
+    UPROPERTY(BlueprintAssignable, Category = "Player Data")
+    FOnPlayerDataLoadedSignature OnPlayerDataLoaded;
+
+protected:
+    FHttpModule* HttpModule;
+    UPROPERTY(EditDefaultsOnly, Category = "API Settings")
+    FString ApiBaseUrl = "https://api.yourserver.com/v1";
+
+    UPROPERTY(EditDefaultsOnly, Category = "API Settings")
+    FString PlayerDataEndpoint = "/getdatainmatch";
+
+    UPROPERTY(EditDefaultsOnly, Category = "API Settings")
+    FString ApiAuthToken = "dummy";
+
+private:
+    void HandlePlayerDataResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
+
+    bool ParsePlayerStats(const TSharedPtr<FJsonObject>& PlayerData, FPlayerStats& OutStats);
+
+    void LogRequestError(const FString& Context, FHttpRequestPtr Request, FHttpResponsePtr Response) const;
+};
+
+// Implementation file (TargetGameMode.cpp)
+
+#include "TargetGameMode.h"
+#include "HttpModule.h"
+#include "Interfaces/IHttpResponse.h"
+
+ATargetGameMode::ATargetGameMode()
+{
+    HttpModule = &FHttpModule::Get();
+}
+
+void ATargetGameMode::RequestPlayerData(const FString& PlayerId)
+{
+    if (!HttpModule)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[PlayerData] HTTP module not available"));
+        return;
+    }
+
+    if (PlayerId.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[PlayerData] Empty PlayerId provided"));
+        return;
+    }
+
+    const FString EndpointUrl = ApiBaseUrl + PlayerDataEndpoint;
+    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = HttpModule->CreateRequest();
+
+    Request->SetTimeout(10); // 10 second timeout
+    Request->OnProcessRequestComplete().BindUObject(this, &ATargetGameMode::HandlePlayerDataResponse);
+    Request->SetURL(EndpointUrl);
+    Request->SetVerb("GET");
+    Request->SetHeader("PlayerID", PlayerId);
+    Request->SetHeader("Authorization", ApiAuthToken);
+    Request->SetHeader("Content-Type", "application/json");
+    Request->SetHeader("Accept", "application/json");
+
+    if (!Request->ProcessRequest())
+    {
+        UE_LOG(LogTemp, Error, TEXT("[PlayerData] Failed to initiate request for PlayerID: %s"), *PlayerId);
+        return;
+    }
+
+    UE_LOG(LogTemp, Verbose, TEXT("[PlayerData] Request initiated for PlayerID: %s"), *PlayerId);
+}
+
+void ATargetGameMode::HandlePlayerDataResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful)
+{
+    if (!bWasSuccessful || !Response.IsValid())
+    {
+        LogRequestError("Request failed", Request, Response);
+        return;
+    }
+
+    const int32 StatusCode = Response->GetResponseCode();
+    if (StatusCode < 200 || StatusCode >= 300)
+    {
+        LogRequestError(FString::Printf(TEXT("Non-success status code: %d"), StatusCode), Request, Response);
+        return;
+    }
+
+    const FString ResponseContent = Response->GetContentAsString();
+    if (ResponseContent.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[PlayerData] Empty response received"));
+        return;
+    }
+
+    TSharedPtr<FJsonObject> JsonObject;
+    TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(ResponseContent);
+
+    if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
+    {
+        UE_LOG(LogTemp, Error, TEXT("[PlayerData] Failed to parse JSON response"));
+        return;
+    }
+
+    if (!JsonObject->HasField("playerData"))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[PlayerData] Missing playerData field in response"));
+        return;
+    }
+
+    FPlayerStats PlayerStats;
+    const TSharedPtr<FJsonObject>& PlayerData = JsonObject->GetObjectField("playerData");
+    
+    if (ParsePlayerStats(PlayerData, PlayerStats))
+    {
+        UE_LOG(LogTemp, Log, TEXT("[PlayerData] Successfully parsed player stats"));
+        OnPlayerDataLoaded.Broadcast(PlayerStats);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[PlayerData] Partial or failed stats parsing"));
+    }
+}
+
+bool ATARGETGameMode::ParsePlayerStats(const TSharedPtr<FJsonObject>& PlayerData, FPlayerStats& OutStats)
+{
+    if (!PlayerData.IsValid())
+    {
+        return false;
+    }
+
+    auto ParseNumericField = [PlayerData](const FString& FieldName, float& OutValue) -> bool
+    {
+        if (PlayerData->HasTypedField<EJson::Object>(FieldName))
+        {
+            const TSharedPtr<FJsonObject> FieldObject = PlayerData->GetObjectField(FieldName);
+            if (FieldObject->HasTypedField<EJson::String>("N"))
+            {
+                const FString ValueStr = FieldObject->GetStringField("N");
+                OutValue = FCString::Atof(*ValueStr);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool bSuccess = true;
+    
+    bSuccess &= ParseNumericField("Wins", OutStats.Wins);
+    bSuccess &= ParseNumericField("Losses", OutStats.Losses);
+    bSuccess &= ParseNumericField("Speed", OutStats.Speed);
+    bSuccess &= ParseNumericField("FireSpeed", OutStats.FireSpeed);
+    bSuccess &= ParseNumericField("Reload", OutStats.Reload);
+    bSuccess &= ParseNumericField("Damage", OutStats.Damage);
+    bSuccess &= ParseNumericField("Hop", OutStats.Hop);
+    bSuccess &= ParseNumericField("Magazine", OutStats.Magazine);
+
+    return bSuccess;
+}
+
+void ATargetGameMode::LogRequestError(const FString& Context, FHttpRequestPtr Request, FHttpResponsePtr Response) const
+{
+    FString Url = Request.IsValid() ? Request->GetURL() : "Invalid Request";
+    int32 ResponseCode = Response.IsValid() ? Response->GetResponseCode() : 0;
+    FString Content = Response.IsValid() ? Response->GetContentAsString() : "No Response";
+
+    UE_LOG(LogTemp, Error,
+        TEXT("[PlayerData] %s\nURL: %s\nStatus: %d\nResponse: %s"),
+        *Context,
+        *Url,
+        ResponseCode,
+        *Content);
+}
